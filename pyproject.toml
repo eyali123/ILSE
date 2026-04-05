@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "ilse"
+version = "0.1.0"
+description = "ILSE: Intermediate Layer Structure Encoders — lightweight GNN/Set encoders that aggregate frozen LLM layer embeddings for classification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "torch-geometric>=2.4",
+    "numpy>=1.21",
+    "scikit-learn>=1.0",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ilse*"]
