@@ -181,19 +181,25 @@ class Aggregator(nn.Module):
 class PerTokenAggregator(nn.Module):
     """
     Aggregator that builds one Cayley graph per sample spanning ALL tokens
-    and ALL layers, then extracts per-token output.
+    and ALL layers.
 
-    Forward signature:
-        x: (batch, seq_len, num_layers, hidden_in)
-        returns: (batch, seq_len, out_dim)
+    Two output modes:
+
+    - output_mode="per_token" (default):
+        Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, seq_len, out_dim)
+        After GNN message passing, pools across layers per token.
+        Use for per-residue protein tasks.
+
+    - output_mode="sequence":
+        Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, out_dim)
+        After GNN message passing, global pool across ALL nodes (tokens × layers).
+        Use for sequence-level classification (e.g., text classification with
+        multi-token Cayley graphs, as in Pythia-14m experiments).
 
     Graph construction:
         For a sample with T tokens and L layers, the graph has T*L nodes
         (plus virtual nodes for Cayley padding). Node indexing:
         node(t, l) = t * L + l  (token t, layer l).
-
-    After GNN message passing, per-token output is obtained by pooling
-    across the L layer-nodes for each token.
 
     This mode is Cayley-only. Supports conv_type="gin", "gcn", "gat".
 
@@ -213,14 +219,18 @@ class PerTokenAggregator(nn.Module):
         num_layers: int,
         hidden_in: int,
         token_pooling: str = "mean",
+        output_mode: str = "per_token",
     ):
         """
         Args:
             config: CayleyConfig (Cayley topology only for multi-token mode).
             num_layers: Number of backbone layers.
             hidden_in: Backbone hidden size.
-            token_pooling: How to pool across layers per token after GNN.
-                "mean" or "sum".
+            token_pooling: How to pool across layers per token after GNN
+                (only used when output_mode="per_token"). "mean" or "sum".
+            output_mode: "per_token" returns (batch, seq_len, out_dim),
+                "sequence" returns (batch, out_dim) via global pooling over
+                all nodes.
         """
         super().__init__()
         if not isinstance(config, CayleyConfig):
@@ -229,22 +239,24 @@ class PerTokenAggregator(nn.Module):
             )
         if token_pooling not in ("mean", "sum"):
             raise ValueError(f"token_pooling must be 'mean' or 'sum', got {token_pooling!r}")
+        if output_mode not in ("per_token", "sequence"):
+            raise ValueError(f"output_mode must be 'per_token' or 'sequence', got {output_mode!r}")
 
         self.config = config
         self.num_layers = num_layers
         self.hidden_in = hidden_in
         self.token_pooling = token_pooling
+        self.output_mode = output_mode
 
-        # GNNEncoder without global pooling — we need per-node features.
-        # We use pooling="mean" as a placeholder; we override the pooling
-        # ourselves in forward() by directly extracting per-node features.
+        # GNNEncoder — we use pooling="mean" for the sequence mode (global
+        # pool), and bypass it in per_token mode.
         self._encoder = GNNEncoder(
             in_dim=hidden_in,
             hidden_dim=config.hidden_dim,
             gnn_layers=config.gnn_layers,
             gin_mlp_layers=config.gin_mlp_layers if config.conv_type == "gin" else 0,
             conv_type=config.conv_type,
-            pooling="mean",  # not actually used — see forward()
+            pooling=config.pooling,
             dropout=config.dropout,
             gat_heads=getattr(config, "gat_heads", 4),
         )
@@ -273,7 +285,8 @@ class PerTokenAggregator(nn.Module):
         Args:
             x: (batch, seq_len, num_layers, hidden_in)
         Returns:
-            (batch, seq_len, out_dim)
+            output_mode="per_token": (batch, seq_len, out_dim)
+            output_mode="sequence":  (batch, out_dim)
         """
         if x.dim() != 4:
             raise ValueError(
@@ -299,24 +312,24 @@ class PerTokenAggregator(nn.Module):
             virt = x.new_zeros(B, num_virtual, D)
             x = torch.cat([x, virt], dim=1)  # (B, num_graph_nodes, D)
 
-        # Run GNNEncoder on the pre-pooling node features.
-        # We need per-node output, not the global-pooled output that
-        # GNNEncoder.forward() returns. So we call the encoder's layers
-        # directly.
-        node_features = self._forward_gnn_nodes(x, edge_index, num_graph_nodes, B)
-        # node_features: (B, num_graph_nodes, hidden_dim)
-
-        # Extract only the real nodes (discard virtual padding).
-        node_features = node_features[:, :total_real_nodes, :]  # (B, T*L, hidden_dim)
-
-        # Reshape to (B, T, L, hidden_dim) and pool across layers per token.
-        node_features = node_features.reshape(B, T, L, -1)
-        if self.token_pooling == "mean":
-            out = node_features.mean(dim=2)  # (B, T, hidden_dim)
+        if self.output_mode == "sequence":
+            # Global pool over ALL nodes → (B, out_dim).
+            # Use GNNEncoder's native forward with global pooling.
+            return self._forward_gnn_global_pool(x, edge_index, num_graph_nodes, B)
         else:
-            out = node_features.sum(dim=2)
+            # Per-node features → pool across layers per token → (B, T, out_dim).
+            node_features = self._forward_gnn_nodes(x, edge_index, num_graph_nodes, B)
+            # node_features: (B, num_graph_nodes, hidden_dim)
 
-        return out
+            # Discard virtual padding nodes.
+            node_features = node_features[:, :total_real_nodes, :]  # (B, T*L, hidden_dim)
+
+            # Reshape to (B, T, L, hidden_dim) and pool across layers per token.
+            node_features = node_features.reshape(B, T, L, -1)
+            if self.token_pooling == "mean":
+                return node_features.mean(dim=2)  # (B, T, hidden_dim)
+            else:
+                return node_features.sum(dim=2)
 
     def _forward_gnn_nodes(
         self,
@@ -365,6 +378,51 @@ class PerTokenAggregator(nn.Module):
         # Reshape back to (B, N_nodes, hidden_dim)
         return h.reshape(B, N_nodes, -1)
 
+    def _forward_gnn_global_pool(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        num_graph_nodes: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Run GNN message passing with global pooling over all nodes per graph.
+
+        Uses GNNEncoder.forward() directly (which includes global_mean/sum/last
+        pooling), constructing the vectorized batch the same way as Aggregator.
+
+        Args:
+            x: (B, num_graph_nodes, hidden_in)
+            edge_index: (2, E) base Cayley edge_index for one graph
+            num_graph_nodes: number of nodes per graph
+            batch_size: B
+
+        Returns:
+            (B, out_dim) — one vector per sample (sequence-level).
+        """
+        B = batch_size
+        N_nodes = num_graph_nodes
+
+        flat_x = x.reshape(B * N_nodes, -1)
+
+        E = edge_index.size(1)
+        flat_ei = edge_index.repeat(1, B)
+        offsets = torch.arange(B, device=x.device).repeat_interleave(E) * N_nodes
+        flat_ei = flat_ei + offsets.unsqueeze(0)
+
+        batch_idx = torch.arange(B, device=x.device).repeat_interleave(N_nodes)
+
+        class _VectorizedBatch:
+            pass
+
+        batch = _VectorizedBatch()
+        batch.x = flat_x
+        batch.edge_index = flat_ei
+        batch.batch = batch_idx
+        batch.num_graphs = B
+
+        return self._encoder(batch)
+
 
 # --------------------------------------------------------------------------- #
 # Factory functions
@@ -412,36 +470,51 @@ def build_per_token_aggregator(
     num_layers: int,
     hidden_in: int,
     token_pooling: str = "mean",
+    output_mode: str = "per_token",
 ) -> PerTokenAggregator:
     """
-    Build a per-token ILSE aggregator that connects ALL tokens and ALL layers
-    in a single Cayley graph per sample.
+    Build a multi-token ILSE aggregator that connects ALL tokens and ALL
+    layers in a single Cayley graph per sample.
 
     Args:
         config: CayleyConfig (Cayley topology only for multi-token mode).
         num_layers: Number of backbone layers.
         hidden_in: Backbone hidden size.
         token_pooling: How to pool across layers per token after GNN message
-            passing. "mean" or "sum".
+            passing. "mean" or "sum". Only used when output_mode="per_token".
+        output_mode: Controls output shape:
+            - "per_token": (batch, seq_len, out_dim) — pool across layers per
+              token. Use for per-residue protein tasks.
+            - "sequence": (batch, out_dim) — global pool over all nodes. Use
+              for sequence-level classification (text classification with
+              multi-token Cayley, as in Pythia-14m experiments).
 
     Returns:
         PerTokenAggregator nn.Module. Forward takes
-        (batch, seq_len, num_layers, hidden_in) and returns
-        (batch, seq_len, aggregator.out_dim).
+        (batch, seq_len, num_layers, hidden_in).
 
-    Example:
+    Examples:
+        Per-token output (per-residue regression):
         >>> from ilse import build_per_token_aggregator, CayleyConfig
         >>> cfg = CayleyConfig(conv_type="gat", gat_heads=4, gnn_layers=2)
         >>> agg = build_per_token_aggregator(cfg, num_layers=37, hidden_in=2560)
-        >>> import torch
         >>> x = torch.randn(4, 1022, 37, 2560)
         >>> y = agg(x)
         >>> y.shape
         torch.Size([4, 1022, 256])
+
+        Sequence-level output (text classification):
+        >>> agg = build_per_token_aggregator(cfg, num_layers=25, hidden_in=1024,
+        ...                                  output_mode="sequence")
+        >>> x = torch.randn(8, 128, 25, 1024)
+        >>> y = agg(x)
+        >>> y.shape
+        torch.Size([8, 256])
     """
     return PerTokenAggregator(
         config=config,
         num_layers=num_layers,
         hidden_in=hidden_in,
         token_pooling=token_pooling,
+        output_mode=output_mode,
     )
