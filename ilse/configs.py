@@ -20,12 +20,17 @@ class CayleyConfig:
     - gnn_layers=1 wins in ~14/18 cases
     - pooling="mean" wins in 14/18 cases (GIN and GCN)
     - lr=1e-3 is best for models up to ~1B; try 1e-4 for larger models (>3B)
+
+    GAT defaults from separate Optuna search across 3 models × 5 tasks:
+    - gat_heads=4 (mode is 2, but 4 is a good middle ground)
+    - weight_decay=1e-3 (higher than GIN/GCN's 1e-4)
     """
 
-    conv_type: Literal["gin", "gcn"] = "gin"
+    conv_type: Literal["gin", "gcn", "gat"] = "gin"
     hidden_dim: int = 256
     gnn_layers: int = 1
-    gin_mlp_layers: int = 1  # only used when conv_type="gin"; ignored for "gcn"
+    gin_mlp_layers: int = 1  # only used when conv_type="gin"; ignored for "gcn"/"gat"
+    gat_heads: int = 4        # only used when conv_type="gat"
     pooling: Literal["mean", "sum", "last"] = "mean"
     dropout: float = 0.1
     lr: float = 1e-3
@@ -45,12 +50,17 @@ class FCConfig:
     - gnn_layers=1 is dominant
     - pooling="mean" is a safe default (data shows a split between "mean" and "last")
     - If performance is below expectation, try pooling="last"
+
+    GAT defaults from separate Optuna search across 3 models × 5 tasks:
+    - gat_heads=4 (mode is 2, but 4 is a good middle ground)
+    - weight_decay=1e-3 (higher than GIN/GCN's 1e-4)
     """
 
-    conv_type: Literal["gin", "gcn"] = "gin"
+    conv_type: Literal["gin", "gcn", "gat"] = "gin"
     hidden_dim: int = 256
     gnn_layers: int = 1
-    gin_mlp_layers: int = 1  # only used when conv_type="gin"; ignored for "gcn"
+    gin_mlp_layers: int = 1  # only used when conv_type="gin"; ignored for "gcn"/"gat"
+    gat_heads: int = 4        # only used when conv_type="gat"
     pooling: Literal["mean", "sum", "last"] = "mean"
     dropout: float = 0.1
     lr: float = 1e-3

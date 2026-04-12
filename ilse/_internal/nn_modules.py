@@ -13,8 +13,11 @@ import torch.nn as nn
 def _import_pyg():
     """Lazy import for PyTorch Geometric (only needed by GNN encoders)."""
     try:
-        from torch_geometric.nn import GINConv, GCNConv, global_mean_pool, global_add_pool
-        return GINConv, GCNConv, global_mean_pool, global_add_pool
+        from torch_geometric.nn import (
+            GINConv, GCNConv, GATConv,
+            global_mean_pool, global_add_pool,
+        )
+        return GINConv, GCNConv, GATConv, global_mean_pool, global_add_pool
     except ImportError:
         raise ImportError(
             "torch-geometric is required for GNN encoders (Cayley, FC). "
@@ -26,8 +29,8 @@ class GNNEncoder(nn.Module):
     """
     GNN encoder for layer-graph inputs.
 
-    Supports GINConv (conv_type="gin") and GCNConv (conv_type="gcn").
-    Used by both Cayley and FC topologies.
+    Supports GINConv (conv_type="gin"), GCNConv (conv_type="gcn"), and
+    GATConv (conv_type="gat"). Used by both Cayley and FC topologies.
     """
 
     def __init__(
@@ -39,10 +42,11 @@ class GNNEncoder(nn.Module):
         conv_type: str = "gin",
         pooling: str = "mean",
         dropout: float = 0.1,
+        gat_heads: int = 4,
     ):
         super().__init__()
-        if conv_type not in ("gin", "gcn"):
-            raise ValueError(f"conv_type must be 'gin' or 'gcn', got {conv_type!r}")
+        if conv_type not in ("gin", "gcn", "gat"):
+            raise ValueError(f"conv_type must be 'gin', 'gcn', or 'gat', got {conv_type!r}")
         if pooling not in ("mean", "sum", "last"):
             raise ValueError(f"pooling must be 'mean', 'sum', or 'last', got {pooling!r}")
 
@@ -54,12 +58,19 @@ class GNNEncoder(nn.Module):
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-        GINConv, GCNConv, _, _ = _import_pyg()
+        GINConv, GCNConv, GATConv, _, _ = _import_pyg()
 
         self.convs = nn.ModuleList()
         for _ in range(gnn_layers):
             if conv_type == "gcn":
                 self.convs.append(GCNConv(hidden_dim, hidden_dim))
+            elif conv_type == "gat":
+                # concat=False: each head produces hidden_dim features,
+                # outputs are averaged. No divisibility constraint on hidden_dim.
+                self.convs.append(GATConv(
+                    hidden_dim, hidden_dim,
+                    heads=gat_heads, concat=False, dropout=dropout,
+                ))
             else:
                 mlp_modules = []
                 for _ in range(gin_mlp_layers):
@@ -71,7 +82,7 @@ class GNNEncoder(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(gnn_layers)])
 
     def forward(self, batch) -> torch.Tensor:
-        _, _, global_mean_pool, global_add_pool = _import_pyg()
+        _, _, _, global_mean_pool, global_add_pool = _import_pyg()
 
         x = self.proj_in(batch.x)
         x = self.act(x)
@@ -80,7 +91,7 @@ class GNNEncoder(nn.Module):
         for conv, norm in zip(self.convs, self.norms):
             x = conv(x, batch.edge_index)
             x = norm(x)
-            if self.conv_type == "gcn":
+            if self.conv_type in ("gcn", "gat"):
                 x = self.act(x)
             x = self.dropout(x)
 

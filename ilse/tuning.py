@@ -61,6 +61,7 @@ def recommended_config(
             hidden_dim=256,
             gnn_layers=1,
             gin_mlp_layers=1,
+            gat_heads=4,
             pooling="mean",
             dropout=0.1,
             lr=lr,
@@ -73,6 +74,7 @@ def recommended_config(
             hidden_dim=256,
             gnn_layers=1,
             gin_mlp_layers=1,
+            gat_heads=4,
             pooling="mean",
             dropout=0.1,
             lr=lr,
@@ -138,20 +140,26 @@ def suggest_config(trial, encoder_type: EncoderType):
     if encoder_type in ("cayley", "fc"):
         cfg_cls = CayleyConfig if encoder_type == "cayley" else FCConfig
 
-        conv_type = trial.suggest_categorical("conv_type", ["gin", "gcn"])
+        conv_type = trial.suggest_categorical("conv_type", ["gin", "gcn", "gat"])
         gin_mlp_layers = (
             trial.suggest_int("gin_mlp_layers", 1, 2) if conv_type == "gin" else 0
         )
+        gat_heads = (
+            trial.suggest_categorical("gat_heads", [2, 4, 8]) if conv_type == "gat" else 4
+        )
+        # GAT empirically benefits from higher weight_decay (1e-3 dominant in search)
+        weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
 
         return cfg_cls(
             conv_type=conv_type,
             hidden_dim=trial.suggest_categorical("hidden_dim", [128, 256, 512]),
             gnn_layers=trial.suggest_int("gnn_layers", 1, 3),
             gin_mlp_layers=gin_mlp_layers,
+            gat_heads=gat_heads,
             pooling=trial.suggest_categorical("pooling", ["mean", "sum", "last"]),
             dropout=trial.suggest_float("dropout", 0.0, 0.5),
             lr=trial.suggest_float("lr", 1e-5, 1e-2, log=True),
-            weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
+            weight_decay=weight_decay,
         )
 
     if encoder_type == "set_encoder":

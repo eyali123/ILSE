@@ -24,6 +24,13 @@ Two entry points:
     agg = build_aggregator(CayleyConfig(), num_layers=37, hidden_in=2560)
     # agg: (N, num_layers, hidden_in) -> (N, agg.out_dim)
 
+3) Per-token aggregator with cross-token Cayley graph (e.g., per-residue
+   protein tasks where you want GNN mixing across all tokens and layers):
+
+    from ilse import build_per_token_aggregator, CayleyConfig
+    agg = build_per_token_aggregator(CayleyConfig(conv_type="gat"), num_layers=37, hidden_in=2560)
+    # agg: (batch, seq_len, num_layers, hidden_in) -> (batch, seq_len, agg.out_dim)
+
 Hyperparameter helpers (optional):
 
     from ilse.tuning import recommended_config, suggest_config
@@ -36,7 +43,12 @@ __version__ = "0.1.0"
 
 from .configs import CayleyConfig, FCConfig, SetEncoderConfig
 from .classifier import ILSEClassifier
-from .aggregator import Aggregator, build_aggregator
+from .aggregator import (
+    Aggregator,
+    PerTokenAggregator,
+    build_aggregator,
+    build_per_token_aggregator,
+)
 from . import tuning
 
 __all__ = [
@@ -45,6 +57,8 @@ __all__ = [
     "FCConfig",
     "SetEncoderConfig",
     "Aggregator",
+    "PerTokenAggregator",
     "build_aggregator",
+    "build_per_token_aggregator",
     "tuning",
 ]
