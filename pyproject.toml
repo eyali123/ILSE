@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=61"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ilse"
@@ -12,13 +12,13 @@ license = {text = "MIT"}
 dependencies = [
     "torch>=2.0",
     "transformers>=4.35",
-    "torch-geometric>=2.4",
     "numpy>=1.21",
     "scikit-learn>=1.0",
     "tqdm",
 ]
 
 [project.optional-dependencies]
+gnn = ["torch-geometric>=2.4"]
 dev = ["pytest", "black", "ruff"]
 
 [tool.setuptools.packages.find]
