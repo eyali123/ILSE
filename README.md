@@ -1,88 +1,156 @@
 # ILSE: Intermediate Layer Structure Encoders
 
-Lightweight encoders (~300K-600K trainable params) that learn to aggregate **all layers** of a frozen LLM for classification, instead of using only the last layer.
+Lightweight encoders (~300K-600K trainable params) that learn to aggregate **all layers** of a frozen LLM, instead of using only the last layer.
 
 Works with any HuggingFace causal/masked LM. No fine-tuning of the base model.
 
 ## Install
 
 ```bash
-# PyTorch Geometric requires matching CUDA/PyTorch versions.
-# Install PyG first: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
-pip install torch-geometric
-
-pip install .          # from source
-# pip install ilse     # (future) from PyPI
+pip install -e .                # core (SetEncoder works immediately)
+pip install -e ".[gnn]"         # + torch-geometric for Cayley/FC encoders
 ```
 
-## Quick Start
+PyG requires matching CUDA/PyTorch versions. See [PyG install guide](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html) if the `[gnn]` extra fails.
+
+## Three Entry Points
+
+### 1. Sklearn-style classifier (simple text classification)
 
 ```python
 from ilse import ILSEClassifier, CayleyConfig
 
-clf = ILSEClassifier(
-    base_model="EleutherAI/pythia-410m",
-    config=CayleyConfig(),    # sensible defaults from hyperparameter search
-    num_classes=6,
-)
-
+clf = ILSEClassifier("EleutherAI/pythia-410m", CayleyConfig(), num_classes=6)
 clf.fit(train_texts, train_labels)
 preds = clf.predict(test_texts)
-acc = clf.score(test_texts, test_labels)
-
-clf.save("model.pt")
-clf = ILSEClassifier.load("model.pt")
 ```
 
-## Three Encoder Families
+### 2. `build_aggregator` (custom fine-tuning pipelines)
 
-| Encoder | Config class | Graph topology | Key idea |
-|---------|-------------|---------------|----------|
-| **Cayley** | `CayleyConfig` | SL(2, Z_n) algebraic graph | Sparse, regular GNN message passing over layers. Adapts to any model size via virtual nodes. |
-| **FC** | `FCConfig` | Fully-connected | Dense GNN — every layer communicates with every other layer. |
-| **SetEncoder** | `SetEncoderConfig` | None (DeepSet) | Permutation-invariant: per-layer MLP -> pool -> MLP. No message passing. |
-
-Both Cayley and FC support two convolution types via `conv_type`:
-- `"gin"` (default): GIN convolution with internal MLP — more expressive
-- `"gcn"`: GCN convolution — simpler, fewer params
-
-## Configuration
-
-All hyperparameters are exposed with empirically-grounded defaults from an Optuna search across 3 LLMs and 6 classification tasks.
+Pure `nn.Module`. You own the backbone, loss, optimizer, and training loop.
 
 ```python
-from ilse import CayleyConfig, FCConfig, SetEncoderConfig
+from ilse import build_aggregator, CayleyConfig
 
-# Use defaults (recommended starting point)
-config = CayleyConfig()
+agg = build_aggregator(CayleyConfig(), num_layers=37, hidden_in=2560)
+# Forward: (N, num_layers, hidden_in) -> (N, agg.out_dim)
 
-# Override specific params
-config = CayleyConfig(
-    conv_type="gcn",      # "gin" (default) or "gcn"
-    hidden_dim=256,       # projection dimension (default: 256)
-    gnn_layers=1,         # number of GNN layers (default: 1)
-    gin_mlp_layers=1,     # MLP layers inside GINConv; ignored for gcn (default: 1)
-    pooling="mean",       # "mean" (default), "sum", or "last"
-    dropout=0.1,          # dropout rate (default: 0.1)
-    lr=1e-3,              # learning rate (default: 1e-3; try 1e-4 for >3B models)
-    weight_decay=1e-4,    # L2 regularization (default: 1e-4)
-    batch_size=64,        # training batch size (default: 64)
-    epochs=50,            # max training epochs (default: 50)
+# Example: per-residue protein task with frozen ESM-2
+with torch.no_grad():
+    out = esm_model(input_ids, attention_mask=mask)
+hs = torch.stack(out.hidden_states, dim=1)    # (B, L, T, D)
+hs = hs.permute(0, 2, 1, 3).reshape(B*T, L, D)  # flatten residues
+h = agg(hs)                                    # (B*T, out_dim)
+h = h.view(B, T, -1)                          # (B, T, out_dim)
+rates = rate_head(h).squeeze(-1)               # (B, T)
+```
+
+### 3. `build_per_token_aggregator` (multi-token Cayley graph)
+
+Builds one Cayley graph per sample spanning **all tokens x all layers**. GNN message passing mixes information across both tokens and layers before producing output.
+
+```python
+from ilse import build_per_token_aggregator, CayleyConfig
+
+# Per-token output (e.g., per-residue regression)
+agg = build_per_token_aggregator(
+    CayleyConfig(conv_type="gat", gat_heads=4, gnn_layers=2),
+    num_layers=37, hidden_in=2560,
+    output_mode="per_token",
 )
+# Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, seq_len, out_dim)
 
-# FC encoder (same params as Cayley, different graph topology)
-config = FCConfig(pooling="last")  # FC shows a mean/last split; try both
+# Sequence-level output (e.g., text classification)
+agg = build_per_token_aggregator(
+    CayleyConfig(), num_layers=25, hidden_in=1024,
+    output_mode="sequence",
+)
+# Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, out_dim)
+```
 
-# SetEncoder (no graph, permutation-invariant)
-config = SetEncoderConfig(
-    pre_pooling_layers=1,   # MLP layers before pooling (default: 1)
-    post_pooling_layers=1,  # MLP layers after pooling (default: 1)
-    pooling="sum",          # "sum" (default, best for classification) or "mean"
-    dropout=0.2,            # slightly higher than GNN variants (default: 0.2)
+## Encoder Families
+
+| Encoder | Config class | Graph topology | PyG required? |
+|---------|-------------|----------------|---------------|
+| **Cayley** | `CayleyConfig` | SL(2, Z_n) algebraic graph | Yes |
+| **FC** | `FCConfig` | Fully-connected | Yes |
+| **SetEncoder** | `SetEncoderConfig` | None (DeepSet) | No |
+
+### Convolution types (Cayley and FC)
+
+All three conv types are supported via `conv_type` on `CayleyConfig` and `FCConfig`:
+
+| Conv type | Parameter | Description |
+|-----------|-----------|-------------|
+| `"gin"` (default) | `gin_mlp_layers` | GIN convolution with internal MLP — most expressive |
+| `"gcn"` | — | GCN convolution — simpler, fewer params |
+| `"gat"` | `gat_heads` | GAT with multi-head attention — data-dependent mixing |
+
+```python
+CayleyConfig(conv_type="gat", gat_heads=4)  # GAT with 4 attention heads
+CayleyConfig(conv_type="gin", gin_mlp_layers=2)  # GIN with 2-layer MLP
+CayleyConfig(conv_type="gcn")  # GCN
+```
+
+## Hyperparameter Helpers
+
+### `recommended_config` — zero-search defaults
+
+Empirically-validated defaults from an Optuna search across 3 LLMs and 6 tasks.
+
+```python
+from ilse.tuning import recommended_config
+
+cfg = recommended_config("cayley")                            # lr=1e-3 (small models)
+cfg = recommended_config("cayley", model_size_hint="large")   # lr=1e-4 (>3B models)
+cfg = recommended_config("set_encoder")                       # DeepSet defaults
+```
+
+### `suggest_config` — Optuna search space
+
+Call inside an Optuna objective to search over the paper's validated hyperparameter space.
+
+```python
+import optuna
+from ilse.tuning import suggest_config
+from ilse import build_aggregator
+
+def objective(trial):
+    cfg = suggest_config(trial, "cayley")   # samples conv_type, hidden_dim, gnn_layers, etc.
+    agg = build_aggregator(cfg, num_layers=37, hidden_in=2560)
+    model = MyModel(agg)
+    return train_and_eval(model)
+
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=100)
+best_cfg = suggest_config(study.best_trial, "cayley")
+```
+
+SQLite storage is sufficient for single-machine search (no PostgreSQL needed).
+
+## Configuration Reference
+
+```python
+from ilse import CayleyConfig
+
+CayleyConfig(
+    conv_type="gin",       # "gin" | "gcn" | "gat"
+    hidden_dim=256,        # projection dimension
+    gnn_layers=1,          # number of GNN layers
+    gin_mlp_layers=1,      # MLP layers inside GINConv (gin only)
+    gat_heads=4,           # attention heads (gat only)
+    pooling="mean",        # "mean" | "sum" | "last"
+    dropout=0.1,
+    lr=1e-3,               # try 1e-4 for >3B models
+    weight_decay=1e-4,     # GAT empirically prefers 1e-3
+    batch_size=64,
+    epochs=50,
 )
 ```
 
-### Default Recommendations by Model Size
+`FCConfig` has the same parameters. `SetEncoderConfig` has `pre_pooling_layers`, `post_pooling_layers` instead of GNN-specific params.
+
+### Defaults by model size
 
 | Parameter | Models up to ~1B | Models >3B |
 |-----------|-----------------|------------|
@@ -90,98 +158,76 @@ config = SetEncoderConfig(
 | `gnn_layers` | `1` | `1` |
 | `hidden_dim` | `256` | `256` |
 
-## API Reference
+## API Summary
 
-### `ILSEClassifier`
+### Aggregators
 
-```python
-ILSEClassifier(
-    base_model: str,              # HuggingFace model name/path
-    config: CayleyConfig | FCConfig | SetEncoderConfig,
-    num_classes: int,
-    device: str = None,           # "cuda"/"cpu"/None (auto)
-    torch_dtype = None,           # e.g. torch.float16 for large models
-    trust_remote_code: bool = False,
-    max_length: int = 2048,       # tokenizer max length
-)
-```
+| Factory | Input | Output | Use case |
+|---------|-------|--------|----------|
+| `build_aggregator(config, L, D)` | `(N, L, D)` | `(N, out_dim)` | Per-sample layer aggregation |
+| `build_per_token_aggregator(..., output_mode="per_token")` | `(B, T, L, D)` | `(B, T, out_dim)` | Per-token with cross-token Cayley mixing |
+| `build_per_token_aggregator(..., output_mode="sequence")` | `(B, T, L, D)` | `(B, out_dim)` | Sequence-level with multi-token Cayley |
 
-**Methods:**
+All aggregators expose `.out_dim` for sizing downstream heads.
+
+### ILSEClassifier
 
 | Method | Description |
 |--------|-------------|
-| `fit(texts, labels, val_texts=None, val_labels=None, val_fraction=0.15)` | Extract embeddings and train. Returns `self`. |
-| `predict(texts) -> List[int]` | Predict class labels. |
-| `predict_proba(texts) -> np.ndarray` | Predict class probabilities, shape `(N, num_classes)`. |
-| `score(texts, labels) -> float` | Classification accuracy. |
-| `save(path)` | Save encoder weights + config (not the LLM). |
-| `ILSEClassifier.load(path)` | Load a saved model. LLM re-loaded on first predict. |
-| `unload_llm()` | Free LLM GPU memory. Encoder stays loaded. |
-
-### Training Details
-
-- **Optimizer**: Adam
-- **Early stopping**: patience=10 epochs on validation accuracy
-- **LR scheduler**: ReduceLROnPlateau (patience=3, factor=0.5)
-- **Loss**: Cross-entropy
-- **Validation**: Stratified split (15%) if no val set provided
+| `fit(texts, labels, val_texts=None, val_labels=None)` | Extract embeddings and train |
+| `predict(texts) -> List[int]` | Predict class labels |
+| `predict_proba(texts) -> np.ndarray` | Class probabilities `(N, num_classes)` |
+| `score(texts, labels) -> float` | Classification accuracy |
+| `save(path)` / `load(path)` | Persist encoder weights + config (not the LLM) |
+| `unload_llm()` | Free LLM GPU memory |
 
 ## How It Works
 
-Standard LLM usage takes only the **last layer** embedding. But intermediate layers contain different linguistic information (syntax, semantics, world knowledge). ILSE trains a small encoder to aggregate **all layers** into a single embedding.
+Standard LLM usage takes only the **last layer** embedding. But intermediate layers contain different information (syntax, semantics, world knowledge). ILSE trains a small encoder to aggregate **all layers**.
 
 ```
-Input text -> Frozen LLM -> [layer_0, layer_1, ..., layer_L]  (L+1 embeddings of dim D)
-                                          |
-                              ILSE Encoder (GNN or DeepSet)
-                                          |
-                              [aggregated embedding]  (dim 256)
-                                          |
-                                Linear -> class prediction
+Input -> Frozen LLM -> [layer_0, layer_1, ..., layer_L]   (L+1 vectors of dim D)
+                                      |
+                          ILSE Encoder (GNN or DeepSet)
+                                      |
+                          [aggregated embedding]           (dim 256)
+                                      |
+                            Task head -> prediction
 ```
 
-The encoder has ~300K-600K trainable parameters (vs billions in the LLM). The LLM stays frozen.
+**Cayley graph**: An algebraic construction (SL(2, Z_n)) that produces a sparse, regular expander graph. Adapts to any number of layers by finding the smallest Cayley graph >= num_layers and padding with virtual nodes.
 
-### Graph Topologies (Cayley and FC)
-
-For GNN encoders, each text produces a **graph over layers**:
-- **Nodes** = layer embeddings (one node per LLM layer)
-- **Edges** = defined by topology (Cayley or fully-connected)
-
-GNN message passing lets layers exchange information before pooling into a single vector.
-
-**Cayley graph (SL(2, Z_n))**: An algebraic construction that produces a sparse, regular graph. Automatically adapts to any number of layers by finding the smallest Cayley graph that fits, padding with zero-initialized virtual nodes.
-
-**FC graph**: Every layer connected to every other. Denser, more expensive for many layers, but lets all layers communicate directly.
+**Vectorized batching**: The GNN path constructs PyG-compatible batches via pure tensor ops (tiled edge_index + offsets). No Python loop, no per-sample `Data` objects. Handles N=4000+ samples per step efficiently.
 
 ## Tested Models
 
-Validated on these LLMs (but works with any HuggingFace transformer):
+Works with any HuggingFace transformer. Validated on:
 
 | Model | Layers | Hidden dim | `base_model` string |
 |-------|--------|-----------|---------------------|
 | Pythia-410m | 25 | 1024 | `"EleutherAI/pythia-410m"` |
 | TinyLlama-1.1B | 23 | 2048 | `"TinyLlama/TinyLlama-1.1B-Chat-v1.0"` |
 | Llama3-8B | 33 | 4096 | `"meta-llama/Meta-Llama-3-8B"` |
+| Gemma2-2B | 27 | 2304 | `"google/gemma-2-2b"` |
 
 ## File Structure
 
 ```
 ilse/
-    __init__.py         # Public API: ILSEClassifier, CayleyConfig, FCConfig, SetEncoderConfig
-    configs.py          # Dataclass configs with Optuna-grounded defaults
-    classifier.py       # ILSEClassifier (fit/predict/save/load)
+    __init__.py          # Public API exports
+    configs.py           # CayleyConfig, FCConfig, SetEncoderConfig
+    aggregator.py        # Aggregator, PerTokenAggregator, build_* factories
+    classifier.py        # ILSEClassifier (sklearn-style)
+    tuning.py            # recommended_config, suggest_config
     _internal/
-        llm.py          # LLMLayerExtractor (generic HF model wrapper)
-        nn_modules.py   # GNNEncoder, SetEncoder, ClassificationHead (PyTorch modules)
-        graph_ops.py    # Cayley graph construction (SL(2,Z_n)), FC edge index
-        dataset.py      # GraphDataset (PyG), TensorDataset (for SetEncoder)
-        training.py     # Training loop with early stopping
+        nn_modules.py    # GNNEncoder (GIN/GCN/GAT), SetEncoder
+        graph_ops.py     # Cayley graph construction, FC edge index
+        llm.py           # LLMLayerExtractor (HF model wrapper)
+        dataset.py       # GraphDataset, TensorDataset
+        training.py      # Training loop with early stopping
 ```
 
 ## Citation
-
-Based on the ILSE paper (Intermediate Layer Structure Encoders). If you use this code, please cite:
 
 ```bibtex
 @article{ilse2025,
