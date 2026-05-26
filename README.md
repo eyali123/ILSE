@@ -1,5 +1,7 @@
 # ILSE: Intermediate Layer Structure Encoders
 
+Implementation of [**Improving LLM Final Representations with Inter-Layer Geometry**](https://arxiv.org/abs/2603.22665) (Blyachman, Ulanovski, Bechler-Speicher, 2026).
+
 Lightweight encoders (~300K-600K trainable params) that learn to aggregate **all layers** of a frozen LLM, instead of using only the last layer.
 
 Works with any HuggingFace causal/masked LM. No fine-tuning of the base model.
@@ -227,19 +229,18 @@ ilse/
         training.py      # Training loop with early stopping
 ```
 
-## Paper
-
-This package implements the method described in:
-
-**ILSE: Intermediate Layer Structure Encoders**
-[arxiv.org/abs/2603.22665](https://arxiv.org/abs/2603.22665)
+## Citation
 
 If you use this code, please cite:
 
 ```bibtex
-@article{ilse2025,
-    title={ILSE: Intermediate Layer Structure Encoders},
-    year={2025},
-    url={https://arxiv.org/abs/2603.22665}
+@misc{2026improvingllmfinalrepresentations,
+      title={Improving LLM Final Representations with Inter-Layer Geometry}, 
+      author={Eyal Blyachman and Tom Ulanovski and Maya Bechler-Speicher},
+      year={2026},
+      eprint={2603.22665},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2603.22665}, 
 }
 ```
