@@ -227,11 +227,19 @@ ilse/
         training.py      # Training loop with early stopping
 ```
 
-## Citation
+## Paper
+
+This package implements the method described in:
+
+**ILSE: Intermediate Layer Structure Encoders**
+[arxiv.org/abs/2603.22665](https://arxiv.org/abs/2603.22665)
+
+If you use this code, please cite:
 
 ```bibtex
 @article{ilse2025,
-    title={ILSE: Intermediate Layer Structure Encoders for LLM Classification},
-    year={2025}
+    title={ILSE: Intermediate Layer Structure Encoders},
+    year={2025},
+    url={https://arxiv.org/abs/2603.22665}
 }
 ```
