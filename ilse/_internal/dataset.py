@@ -47,9 +47,10 @@ class GraphDataset(TorchDataset):
 
     def __getitem__(self, idx):
         x = torch.as_tensor(self.items[idx], dtype=torch.float32)  # [L, D]
+        num_real = x.size(0)
 
         # Pad with virtual nodes if graph has more nodes than layers (cayley)
-        num_virtual = self.num_graph_nodes - x.size(0)
+        num_virtual = self.num_graph_nodes - num_real
         if num_virtual > 0:
             virt = torch.zeros(num_virtual, x.size(1), dtype=x.dtype)
             x = torch.cat([x, virt], dim=0)
@@ -58,6 +59,12 @@ class GraphDataset(TorchDataset):
 
         data = GeomData(x=x, edge_index=self.edge_index.clone())
         data.y = torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        # Node-level mask marking real layer-nodes (True) vs virtual padding
+        # (False). PyG concatenates it across the batch; GNNEncoder pools over
+        # real nodes only.
+        is_real = torch.zeros(x.size(0), dtype=torch.bool)
+        is_real[:num_real] = True
+        data.is_real = is_real
         return data
 
 

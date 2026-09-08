@@ -131,8 +131,9 @@ def suggest_config(trial, encoder_type: EncoderType):
           gnn_layers, pooling, dropout) plus optimizer params (lr,
           weight_decay). It does NOT search batch_size or epochs -- those
           are usually fixed by compute budget and dataset size.
-        - For Cayley/FC, `conv_type` is searched over ("gin", "gcn").
-          `gin_mlp_layers` is only searched when `conv_type == "gin"`.
+        - For Cayley/FC, `conv_type` is searched over ("gin", "gcn", "gat").
+          `gin_mlp_layers` is only searched when `conv_type == "gin"`;
+          `gat_heads` only when `conv_type == "gat"`.
         - Ranges match the ILSE paper's sweeps. If you want to widen or
           narrow the space, write your own suggest function -- this one is
           intentionally simple and not parameterized.
@@ -156,7 +157,7 @@ def suggest_config(trial, encoder_type: EncoderType):
             gnn_layers=trial.suggest_int("gnn_layers", 1, 3),
             gin_mlp_layers=gin_mlp_layers,
             gat_heads=gat_heads,
-            pooling=trial.suggest_categorical("pooling", ["mean", "sum", "last"]),
+            pooling=trial.suggest_categorical("pooling", ["mean", "sum"]),
             dropout=trial.suggest_float("dropout", 0.0, 0.5),
             lr=trial.suggest_float("lr", 1e-5, 1e-2, log=True),
             weight_decay=weight_decay,

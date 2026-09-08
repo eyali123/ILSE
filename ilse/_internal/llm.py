@@ -20,6 +20,8 @@ class LLMLayerExtractor:
         # embeddings: list of np.ndarray, each shape (num_layers, hidden_dim)
     """
 
+    TOKEN_POOLINGS = ("mean", "last", "first", "mean_including_padding")
+
     def __init__(
         self,
         model_name_or_path: str,
@@ -27,11 +29,18 @@ class LLMLayerExtractor:
         torch_dtype=None,
         trust_remote_code: bool = False,
         max_length: int = 2048,
+        token_pooling: str = "mean",
     ):
         from transformers import AutoModel, AutoTokenizer
 
+        if token_pooling not in self.TOKEN_POOLINGS:
+            raise ValueError(
+                f"token_pooling must be one of {self.TOKEN_POOLINGS}, got {token_pooling!r}"
+            )
+
         self.model_name = model_name_or_path
         self.max_length = max_length
+        self.token_pooling = token_pooling
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,7 +74,13 @@ class LLMLayerExtractor:
         show_progress: bool = True,
     ) -> List[np.ndarray]:
         """
-        Extract layer-wise embeddings for each text (mean-pooled over tokens).
+        Extract layer-wise embeddings for each text, pooled over tokens.
+
+        The token pooling is set on the extractor (see `token_pooling`):
+        - "mean" (default): mean over non-padding tokens.
+        - "mean_including_padding": naive mean over all positions.
+        - "last": last non-padding token (useful for decoder-only LMs).
+        - "first": first token (CLS-style).
 
         Args:
             texts: Input texts.
@@ -93,15 +108,11 @@ class LLMLayerExtractor:
             outputs = self.model(**encoded)
             hidden_states = outputs.hidden_states  # tuple of (B, seq_len, D)
 
-            # Build attention mask for mean pooling (ignore padding tokens)
-            mask = encoded["attention_mask"].unsqueeze(-1).float()  # (B, seq_len, 1)
-
             # Stack all layers: (num_layers, B, seq_len, D)
             stacked = torch.stack(hidden_states, dim=0)
+            attn = encoded["attention_mask"]  # (B, seq_len)
 
-            # Mean pool over non-padding tokens: (num_layers, B, D)
-            masked = stacked * mask.unsqueeze(0)
-            pooled = masked.sum(dim=2) / mask.unsqueeze(0).sum(dim=2).clamp(min=1e-9)
+            pooled = self._pool_tokens(stacked, attn)  # (num_layers, B, D)
 
             # Convert to per-sample arrays: each (num_layers, D)
             pooled_np = pooled.cpu().float().numpy()  # (num_layers, B, D)
@@ -109,6 +120,41 @@ class LLMLayerExtractor:
                 all_embeddings.append(pooled_np[:, i, :])  # (num_layers, D)
 
         return all_embeddings
+
+    def _pool_tokens(self, stacked: torch.Tensor, attn: torch.Tensor) -> torch.Tensor:
+        """
+        Pool token embeddings per layer.
+
+        Args:
+            stacked: (num_layers, B, seq_len, D)
+            attn: (B, seq_len) attention mask (1 = real token, 0 = padding)
+        Returns:
+            (num_layers, B, D)
+        """
+        if self.token_pooling == "mean":
+            mask = attn.unsqueeze(-1).float().unsqueeze(0)  # (1, B, seq_len, 1)
+            masked = stacked * mask
+            return masked.sum(dim=2) / mask.sum(dim=2).clamp(min=1e-9)
+
+        if self.token_pooling == "mean_including_padding":
+            return stacked.mean(dim=2)
+
+        # "first"/"last": locate real tokens via the mask so this is correct
+        # for both right- and left-padding tokenizers.
+        B, seq_len = attn.shape
+        positions = torch.arange(seq_len, device=attn.device).expand(B, seq_len)
+        is_real = attn.bool()
+        rows = torch.arange(B, device=stacked.device)
+
+        if self.token_pooling == "first":
+            first_idx = positions.masked_fill(~is_real, seq_len).min(dim=1).values
+            first_idx = first_idx.clamp(max=seq_len - 1)
+            return stacked[:, rows, first_idx, :]
+
+        # "last": last non-padding token per sample.
+        last_idx = positions.masked_fill(~is_real, -1).max(dim=1).values
+        last_idx = last_idx.clamp(min=0)
+        return stacked[:, rows, last_idx, :]
 
     def unload(self):
         """Free GPU memory by deleting the model."""

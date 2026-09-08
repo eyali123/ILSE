@@ -17,7 +17,19 @@ PyG requires matching CUDA/PyTorch versions. See [PyG install guide](https://pyt
 
 ## Three Entry Points
 
+Which one do you need?
+
+| Use case | Entry point |
+|----------|-------------|
+| Plain text classification, want a working baseline fast | **`ILSEClassifier`** |
+| Your own backbone / loss / training loop; one aggregated vector per input | **`build_aggregator`** |
+| Per-token output *and* you want tokens to exchange information through the graph (e.g. per-residue protein tasks) | **`build_per_token_aggregator`** |
+
+`num_layers` and `hidden_in` are the number of hidden layers **+ 1** (the embedding layer) and the backbone hidden size. Don't hardcode them — use `num_layers_for(model)` / `hidden_size_for(model)`.
+
 ### 1. Sklearn-style classifier (simple text classification)
+
+Extracts frozen layer embeddings and trains the encoder + a linear head for you. Best when you just want text classification without writing a training loop.
 
 ```python
 from ilse import ILSEClassifier, CayleyConfig
@@ -25,49 +37,59 @@ from ilse import ILSEClassifier, CayleyConfig
 clf = ILSEClassifier("EleutherAI/pythia-410m", CayleyConfig(), num_classes=6)
 clf.fit(train_texts, train_labels)
 preds = clf.predict(test_texts)
+acc = clf.score(test_texts, test_labels)
 ```
 
 ### 2. `build_aggregator` (custom fine-tuning pipelines)
 
-Pure `nn.Module`. You own the backbone, loss, optimizer, and training loop.
+Pure `nn.Module` mapping `(N, num_layers, hidden_in) -> (N, out_dim)`. You own the backbone, loss, optimizer, and training loop. Use it for any task where each input collapses to a single aggregated vector (classification, regression, ordinal, retrieval, per-residue tasks where you flatten `batch*seq_len` into `N`).
 
 ```python
-from ilse import build_aggregator, CayleyConfig
+import torch
+from ilse import build_aggregator, CayleyConfig, num_layers_for, hidden_size_for
 
-agg = build_aggregator(CayleyConfig(), num_layers=37, hidden_in=2560)
+name = "EleutherAI/pythia-410m"
+agg = build_aggregator(CayleyConfig(),
+                       num_layers=num_layers_for(name),   # 25 for pythia-410m
+                       hidden_in=hidden_size_for(name))   # 1024
 # Forward: (N, num_layers, hidden_in) -> (N, agg.out_dim)
 
-# Example: per-residue protein task with frozen ESM-2
+# Example: per-residue protein task with a frozen PLM (e.g. ESM-2), treating
+# each residue as an independent sample (no cross-residue mixing here).
 with torch.no_grad():
     out = esm_model(input_ids, attention_mask=mask)
-hs = torch.stack(out.hidden_states, dim=1)    # (B, L, T, D)
-hs = hs.permute(0, 2, 1, 3).reshape(B*T, L, D)  # flatten residues
-h = agg(hs)                                    # (B*T, out_dim)
-h = h.view(B, T, -1)                          # (B, T, out_dim)
-rates = rate_head(h).squeeze(-1)               # (B, T)
+hs = torch.stack(out.hidden_states, dim=1)      # (B, L, T, D)
+hs = hs.permute(0, 2, 1, 3).reshape(B * T, L, D)  # flatten residues -> (B*T, L, D)
+h = agg(hs)                                     # (B*T, out_dim)
+h = h.view(B, T, -1)                            # (B, T, out_dim)
+rates = rate_head(h).squeeze(-1)                # (B, T)
 ```
 
 ### 3. `build_per_token_aggregator` (multi-token Cayley graph)
 
-Builds one Cayley graph per sample spanning **all tokens x all layers**. GNN message passing mixes information across both tokens and layers before producing output.
+Builds **one Cayley graph per sample spanning all tokens × all layers**, so GNN message passing mixes information across both tokens and layers before producing output. This is the version we used for **per-residue protein tasks with frozen PLMs**, where a residue's prediction should depend on its neighbours, not only its own layer stack.
+
+> **Cost:** the graph has `seq_len × num_layers` nodes and the Cayley graph is sized to fit that (`|SL(2, Zₙ)| ~ n³`). Long sequences make very large graphs that are slow to build and memory-heavy. Keep `seq_len` modest or chunk long sequences; a warning is emitted past a few thousand nodes.
 
 ```python
+import torch
 from ilse import build_per_token_aggregator, CayleyConfig
 
-# Per-token output (e.g., per-residue regression)
+# Per-token output (per-residue regression over a short window)
 agg = build_per_token_aggregator(
     CayleyConfig(conv_type="gat", gat_heads=4, gnn_layers=2),
-    num_layers=37, hidden_in=2560,
+    num_layers=13, hidden_in=480,          # e.g. a small ESM-2
     output_mode="per_token",
 )
-# Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, seq_len, out_dim)
+x = torch.randn(2, 16, 13, 480)            # (batch, seq_len, num_layers, hidden_in)
+y = agg(x)                                 # (2, 16, 256) -> (batch, seq_len, out_dim)
 
-# Sequence-level output (e.g., text classification)
+# Sequence-level output (short-text classification)
 agg = build_per_token_aggregator(
-    CayleyConfig(), num_layers=25, hidden_in=1024,
+    CayleyConfig(), num_layers=13, hidden_in=480,
     output_mode="sequence",
 )
-# Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, out_dim)
+y = agg(torch.randn(4, 16, 13, 480))       # (4, 256) -> (batch, out_dim)
 ```
 
 ## Encoder Families
@@ -119,7 +141,7 @@ from ilse import build_aggregator
 
 def objective(trial):
     cfg = suggest_config(trial, "cayley")   # samples conv_type, hidden_dim, gnn_layers, etc.
-    agg = build_aggregator(cfg, num_layers=37, hidden_in=2560)
+    agg = build_aggregator(cfg, num_layers=25, hidden_in=1024)
     model = MyModel(agg)
     return train_and_eval(model)
 
@@ -141,7 +163,8 @@ CayleyConfig(
     gnn_layers=1,          # number of GNN layers
     gin_mlp_layers=1,      # MLP layers inside GINConv (gin only)
     gat_heads=4,           # attention heads (gat only)
-    pooling="mean",        # "mean" | "sum" | "last"
+    pooling="mean",        # "mean" | "sum" (over real layer-nodes only;
+                           #   Cayley virtual padding nodes are excluded)
     dropout=0.1,
     lr=1e-3,               # try 1e-4 for >3B models
     weight_decay=1e-4,     # GAT empirically prefers 1e-3
@@ -197,7 +220,7 @@ Input -> Frozen LLM -> [layer_0, layer_1, ..., layer_L]   (L+1 vectors of dim D)
                             Task head -> prediction
 ```
 
-**Cayley graph**: An algebraic construction (SL(2, Z_n)) that produces a sparse, regular expander graph. Adapts to any number of layers by finding the smallest Cayley graph >= num_layers and padding with virtual nodes.
+**Cayley graph**: An algebraic construction (SL(2, Z_n)) that produces a sparse, regular expander graph. Adapts to any number of layers by finding the smallest Cayley graph >= num_layers and padding with virtual nodes. Virtual nodes participate in message passing but are excluded from the final pooling, so the aggregated vector reflects only the real LLM layers.
 
 **Vectorized batching**: The GNN path constructs PyG-compatible batches via pure tensor ops (tiled edge_index + offsets). No Python loop, no per-sample `Data` objects. Handles N=4000+ samples per step efficiently.
 

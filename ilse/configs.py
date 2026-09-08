@@ -24,6 +24,9 @@ class CayleyConfig:
     GAT defaults from separate Optuna search across 3 models × 5 tasks:
     - gat_heads=4 (mode is 2, but 4 is a good middle ground)
     - weight_decay=1e-3 (higher than GIN/GCN's 1e-4)
+
+    Pooling is over the real layer-nodes only (Cayley virtual padding nodes are
+    excluded from the pool, though they participate in message passing).
     """
 
     conv_type: Literal["gin", "gcn", "gat"] = "gin"
@@ -31,7 +34,7 @@ class CayleyConfig:
     gnn_layers: int = 1
     gin_mlp_layers: int = 1  # only used when conv_type="gin"; ignored for "gcn"/"gat"
     gat_heads: int = 4        # only used when conv_type="gat"
-    pooling: Literal["mean", "sum", "last"] = "mean"
+    pooling: Literal["mean", "sum"] = "mean"
     dropout: float = 0.1
     lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -48,12 +51,13 @@ class FCConfig:
 
     Defaults grounded in Optuna search across 18 (model, task) combos:
     - gnn_layers=1 is dominant
-    - pooling="mean" is a safe default (data shows a split between "mean" and "last")
-    - If performance is below expectation, try pooling="last"
+    - pooling="mean" is a safe default; try pooling="sum" if it underperforms
 
     GAT defaults from separate Optuna search across 3 models × 5 tasks:
     - gat_heads=4 (mode is 2, but 4 is a good middle ground)
     - weight_decay=1e-3 (higher than GIN/GCN's 1e-4)
+
+    Pooling is over the real layer-nodes only.
     """
 
     conv_type: Literal["gin", "gcn", "gat"] = "gin"
@@ -61,7 +65,7 @@ class FCConfig:
     gnn_layers: int = 1
     gin_mlp_layers: int = 1  # only used when conv_type="gin"; ignored for "gcn"/"gat"
     gat_heads: int = 4        # only used when conv_type="gat"
-    pooling: Literal["mean", "sum", "last"] = "mean"
+    pooling: Literal["mean", "sum"] = "mean"
     dropout: float = 0.1
     lr: float = 1e-3
     weight_decay: float = 1e-4

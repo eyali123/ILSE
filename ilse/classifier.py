@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 
 from .configs import CayleyConfig, FCConfig, SetEncoderConfig
 from ._internal.llm import LLMLayerExtractor
-from ._internal.nn_modules import GNNEncoder, SetEncoder, ClassificationHead
+from ._internal.nn_modules import SetEncoder, ClassificationHead, build_gnn_encoder
 from ._internal.dataset import GraphDataset, TensorDataset, graph_collate, tensor_collate
 from ._internal.training import train_model
 
@@ -44,6 +44,7 @@ class ILSEClassifier:
         torch_dtype=None,
         trust_remote_code: bool = False,
         max_length: int = 2048,
+        token_pooling: str = "mean",
     ):
         """
         Args:
@@ -54,6 +55,8 @@ class ILSEClassifier:
             torch_dtype: Optional dtype for LLM loading (e.g. torch.float16).
             trust_remote_code: Pass to HuggingFace model loading.
             max_length: Maximum token length for the tokenizer.
+            token_pooling: How to pool token embeddings per layer -- "mean"
+                (default), "last", "first", or "mean_including_padding".
         """
         self.base_model = base_model
         self.config = config
@@ -61,6 +64,7 @@ class ILSEClassifier:
         self.torch_dtype = torch_dtype
         self.trust_remote_code = trust_remote_code
         self.max_length = max_length
+        self.token_pooling = token_pooling
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -83,6 +87,7 @@ class ILSEClassifier:
                 torch_dtype=self.torch_dtype,
                 trust_remote_code=self.trust_remote_code,
                 max_length=self.max_length,
+                token_pooling=self.token_pooling,
             )
             self._num_layers = self._extractor.num_layers
             self._hidden_dim = self._extractor.hidden_dim
@@ -93,15 +98,7 @@ class ILSEClassifier:
         cfg = self.config
 
         if isinstance(cfg, (CayleyConfig, FCConfig)):
-            self._encoder = GNNEncoder(
-                in_dim=self._hidden_dim,
-                hidden_dim=cfg.hidden_dim,
-                gnn_layers=cfg.gnn_layers,
-                gin_mlp_layers=cfg.gin_mlp_layers if cfg.conv_type == "gin" else 0,
-                conv_type=cfg.conv_type,
-                pooling=cfg.pooling,
-                dropout=cfg.dropout,
-            )
+            self._encoder = build_gnn_encoder(cfg, self._hidden_dim)
             enc_out_dim = cfg.hidden_dim
 
         elif isinstance(cfg, SetEncoderConfig):
@@ -168,22 +165,25 @@ class ILSEClassifier:
         if verbose:
             print(f"Extracting layer embeddings from {self.base_model} ...")
             print(f"  {self._num_layers} layers, {self._hidden_dim}-dim")
-        all_texts = list(texts)
-        all_labels = list(labels)
 
         if val_texts is not None:
-            all_texts += list(val_texts)
             train_emb = extractor.extract(list(texts), batch_size=extract_batch_size, show_progress=verbose)
             val_emb = extractor.extract(list(val_texts), batch_size=extract_batch_size, show_progress=verbose)
             train_labels = list(labels)
             v_labels = list(val_labels)
         else:
-            all_emb = extractor.extract(all_texts, batch_size=extract_batch_size, show_progress=verbose)
-            # Split
+            all_labels = list(labels)
+            all_emb = extractor.extract(list(texts), batch_size=extract_batch_size, show_progress=verbose)
+            # Split (stratified when every class has >=2 examples; else random).
             indices = list(range(len(all_emb)))
-            train_idx, val_idx = train_test_split(
-                indices, test_size=val_fraction, random_state=42, stratify=all_labels
-            )
+            try:
+                train_idx, val_idx = train_test_split(
+                    indices, test_size=val_fraction, random_state=42, stratify=all_labels
+                )
+            except ValueError:
+                train_idx, val_idx = train_test_split(
+                    indices, test_size=val_fraction, random_state=42, stratify=None
+                )
             train_emb = [all_emb[i] for i in train_idx]
             val_emb = [all_emb[i] for i in val_idx]
             train_labels = [all_labels[i] for i in train_idx]
@@ -281,6 +281,7 @@ class ILSEClassifier:
             "num_layers": self._num_layers,
             "hidden_dim": self._hidden_dim,
             "max_length": self.max_length,
+            "token_pooling": self.token_pooling,
         }
         torch.save(state, path)
 
@@ -296,6 +297,10 @@ class ILSEClassifier:
         Load a saved ILSEClassifier.
 
         The base LLM is re-downloaded/loaded from HuggingFace on first predict().
+
+        Note: the checkpoint stores the config object, so it is unpickled with
+        `weights_only=False`. Only load checkpoints you trust / produced
+        yourself.
         """
         state = torch.load(path, map_location="cpu", weights_only=False)
 
@@ -307,6 +312,7 @@ class ILSEClassifier:
             torch_dtype=torch_dtype,
             trust_remote_code=trust_remote_code,
             max_length=state.get("max_length", 2048),
+            token_pooling=state.get("token_pooling", "mean"),
         )
         obj._num_layers = state["num_layers"]
         obj._hidden_dim = state["hidden_dim"]

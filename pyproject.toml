@@ -23,4 +23,10 @@ dev = ["pytest", "black", "ruff"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ilse*"]
+include = ["ilse*"]   # tests/ intentionally excluded from the built package
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "llm: requires downloading a HuggingFace model (needs network/cache)",
+]

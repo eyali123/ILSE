@@ -2,7 +2,7 @@
 Core neural network modules for ILSE encoders.
 
 Three encoder families:
-- GNNEncoder: GIN/GCN message passing over layer-graphs (used by Cayley and FC)
+- GNNEncoder: GIN/GCN/GAT message passing over layer-graphs (used by Cayley and FC)
 - SetEncoder: DeepSet-style phi -> pool -> rho (permutation-invariant)
 - ClassificationHead: simple linear head on top of any encoder
 """
@@ -31,6 +31,11 @@ class GNNEncoder(nn.Module):
 
     Supports GINConv (conv_type="gin"), GCNConv (conv_type="gcn"), and
     GATConv (conv_type="gat"). Used by both Cayley and FC topologies.
+
+    Pooling is over the REAL layer-nodes only. Cayley graphs pad up to the
+    nearest SL(2, Z_n) size with virtual nodes; those participate in message
+    passing but are excluded from the final pool (via `batch.is_real`), so the
+    aggregated vector reflects only the actual LLM layers.
     """
 
     def __init__(
@@ -47,8 +52,8 @@ class GNNEncoder(nn.Module):
         super().__init__()
         if conv_type not in ("gin", "gcn", "gat"):
             raise ValueError(f"conv_type must be 'gin', 'gcn', or 'gat', got {conv_type!r}")
-        if pooling not in ("mean", "sum", "last"):
-            raise ValueError(f"pooling must be 'mean', 'sum', or 'last', got {pooling!r}")
+        if pooling not in ("mean", "sum"):
+            raise ValueError(f"pooling must be 'mean' or 'sum', got {pooling!r}")
 
         self.conv_type = conv_type
         self.pooling = pooling
@@ -58,7 +63,9 @@ class GNNEncoder(nn.Module):
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-        GINConv, GCNConv, GATConv, _, _ = _import_pyg()
+        GINConv, GCNConv, GATConv, global_mean_pool, global_add_pool = _import_pyg()
+        # Cache the pooling op once instead of importing PyG on every forward.
+        self._pool_fn = global_mean_pool if pooling == "mean" else global_add_pool
 
         self.convs = nn.ModuleList()
         for _ in range(gnn_layers):
@@ -82,8 +89,6 @@ class GNNEncoder(nn.Module):
         self.norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(gnn_layers)])
 
     def forward(self, batch) -> torch.Tensor:
-        _, _, _, global_mean_pool, global_add_pool = _import_pyg()
-
         x = self.proj_in(batch.x)
         x = self.act(x)
         x = self.dropout(x)
@@ -95,17 +100,37 @@ class GNNEncoder(nn.Module):
                 x = self.act(x)
             x = self.dropout(x)
 
-        if self.pooling == "mean":
-            return global_mean_pool(x, batch.batch)
-        elif self.pooling == "sum":
-            return global_add_pool(x, batch.batch)
-        elif self.pooling == "last":
-            num_graphs = batch.num_graphs
-            indices = torch.zeros(num_graphs, dtype=torch.long, device=x.device)
-            for g in range(num_graphs):
-                nodes = (batch.batch == g).nonzero(as_tuple=True)[0]
-                indices[g] = nodes[-1]
-            return x[indices]
+        # Pool over real nodes only. Virtual padding nodes (Cayley) carry no
+        # LLM layer and are dropped here even though they took part in message
+        # passing above.
+        node_batch = batch.batch
+        is_real = getattr(batch, "is_real", None)
+        if is_real is not None:
+            x = x[is_real]
+            node_batch = node_batch[is_real]
+
+        size = getattr(batch, "num_graphs", None)
+        return self._pool_fn(x, node_batch, size=size)
+
+
+def build_gnn_encoder(config, in_dim: int) -> GNNEncoder:
+    """
+    Construct a GNNEncoder from a Cayley/FC config.
+
+    Single source of truth for turning a config into an encoder, shared by
+    ILSEClassifier and the aggregator factories so they cannot drift apart
+    (e.g. all paths pass gat_heads).
+    """
+    return GNNEncoder(
+        in_dim=in_dim,
+        hidden_dim=config.hidden_dim,
+        gnn_layers=config.gnn_layers,
+        gin_mlp_layers=config.gin_mlp_layers if config.conv_type == "gin" else 0,
+        conv_type=config.conv_type,
+        pooling=config.pooling,
+        dropout=config.dropout,
+        gat_heads=getattr(config, "gat_heads", 4),
+    )
 
 
 class SetEncoder(nn.Module):

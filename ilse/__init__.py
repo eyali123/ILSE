@@ -9,7 +9,7 @@ Three encoder families:
 - FCConfig:         GNN with fully-connected graph topology
 - SetEncoderConfig: DeepSet (permutation-invariant, no message passing)
 
-Two entry points:
+Three entry points:
 
 1) Sklearn-style classifier for simple sequence classification:
 
@@ -49,6 +49,7 @@ from .aggregator import (
     build_aggregator,
     build_per_token_aggregator,
 )
+from .model_utils import num_layers_for, hidden_size_for
 from . import tuning
 
 __all__ = [
@@ -60,5 +61,7 @@ __all__ = [
     "PerTokenAggregator",
     "build_aggregator",
     "build_per_token_aggregator",
+    "num_layers_for",
+    "hidden_size_for",
     "tuning",
 ]

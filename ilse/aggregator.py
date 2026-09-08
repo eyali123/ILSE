@@ -18,16 +18,66 @@ Two aggregator classes:
 
 Both are pure nn.Modules. No LLM, no training loop, no caching, no labels.
 """
+import types
 from typing import Union
 
 import torch
 import torch.nn as nn
 
 from .configs import CayleyConfig, FCConfig, SetEncoderConfig
-from ._internal.nn_modules import GNNEncoder, SetEncoder
+from ._internal.nn_modules import GNNEncoder, SetEncoder, build_gnn_encoder
 from ._internal.graph_ops import build_edge_index
 
 AggregatorConfig = Union[CayleyConfig, FCConfig, SetEncoderConfig]
+
+
+# --------------------------------------------------------------------------- #
+# Vectorized batching helpers
+#
+# Every sample shares the same graph topology, so instead of building per-sample
+# PyG `Data` objects and calling `Batch.from_data_list` (a Python loop), we tile
+# and offset a single edge_index in one shot and hand GNNEncoder a lightweight
+# stand-in for a PyG Batch. This keeps the GNN path fast even for large N.
+# --------------------------------------------------------------------------- #
+
+def _tiled_edge_index(edge_index: torch.Tensor, num_nodes: int, n_graphs: int,
+                      device: torch.device) -> torch.Tensor:
+    """Tile a single-graph edge_index n_graphs times, offsetting each copy."""
+    edge_index = edge_index.to(device)
+    E = edge_index.size(1)
+    offsets = (torch.arange(n_graphs, device=device).repeat_interleave(E) * num_nodes)
+    return edge_index.repeat(1, n_graphs) + offsets.unsqueeze(0)
+
+
+def _batch_assignment(num_nodes: int, n_graphs: int, device: torch.device) -> torch.Tensor:
+    """Batch vector [0,0,...,1,1,...,n-1,...] mapping each node to its graph."""
+    return torch.arange(n_graphs, device=device).repeat_interleave(num_nodes)
+
+
+def _real_node_mask(num_real: int, num_nodes: int, n_graphs: int,
+                    device: torch.device):
+    """Flat bool mask (n_graphs*num_nodes,) marking real nodes; None if no padding."""
+    if num_real >= num_nodes:
+        return None
+    per_graph = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+    per_graph[:num_real] = True
+    return per_graph.repeat(n_graphs)
+
+
+def _pyg_like_batch(flat_x, flat_edge_index, batch_idx, n_graphs, is_real):
+    """
+    Build a minimal stand-in that GNNEncoder.forward() consumes like a PyG
+    Batch. GNNEncoder only reads .x / .edge_index / .batch / .num_graphs /
+    .is_real -- never the full PyG Batch API -- so a SimpleNamespace suffices
+    and avoids constructing real Data/Batch objects.
+    """
+    return types.SimpleNamespace(
+        x=flat_x,
+        edge_index=flat_edge_index,
+        batch=batch_idx,
+        num_graphs=n_graphs,
+        is_real=is_real,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -53,7 +103,8 @@ class Aggregator(nn.Module):
       loop over samples), making this efficient even for large N (~4000+
       residues per batch in per-token use cases).
     - For Cayley, the graph may have more nodes than `num_layers` (the
-      smallest SL(2, Z_n) with enough nodes). Extra positions are zero-padded.
+      smallest SL(2, Z_n) with enough nodes). Extra positions are zero-padded
+      and participate in message passing, but are excluded from the final pool.
     - `out_dim` is exposed so the caller can size their head correctly.
     """
 
@@ -75,16 +126,7 @@ class Aggregator(nn.Module):
                     f"GNN path expects CayleyConfig or FCConfig, got {type(config).__name__}"
                 )
 
-            self._encoder = GNNEncoder(
-                in_dim=hidden_in,
-                hidden_dim=config.hidden_dim,
-                gnn_layers=config.gnn_layers,
-                gin_mlp_layers=config.gin_mlp_layers if config.conv_type == "gin" else 0,
-                conv_type=config.conv_type,
-                pooling=config.pooling,
-                dropout=config.dropout,
-                gat_heads=getattr(config, "gat_heads", 4),
-            )
+            self._encoder = build_gnn_encoder(config, hidden_in)
 
             topology = "cayley" if isinstance(config, CayleyConfig) else "fully_connected"
             edge_index, num_graph_nodes = build_edge_index(num_layers, topology)
@@ -130,14 +172,7 @@ class Aggregator(nn.Module):
         return self._forward_gnn_vectorized(x)
 
     def _forward_gnn_vectorized(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Vectorized GNN forward. Constructs a PyG-compatible Batch from the
-        dense tensor using pure tensor ops — no Python loop, no per-sample
-        Data objects, no Batch.from_data_list.
-
-        Every sample shares the same topology (edge_index, num_graph_nodes),
-        so we tile and offset in one shot.
-        """
+        """Vectorized GNN forward (see module-level batching helpers)."""
         N = x.size(0)
         num_nodes = self.num_graph_nodes
 
@@ -147,30 +182,12 @@ class Aggregator(nn.Module):
             virt = x.new_zeros(N, num_virtual, self.hidden_in)
             x = torch.cat([x, virt], dim=1)  # (N, num_nodes, hidden_in)
 
-        # Flatten to (N * num_nodes, hidden_in).
         flat_x = x.reshape(N * num_nodes, self.hidden_in)
+        flat_ei = _tiled_edge_index(self.edge_index, num_nodes, N, x.device)
+        batch_idx = _batch_assignment(num_nodes, N, x.device)
+        is_real = _real_node_mask(self.num_layers, num_nodes, N, x.device)
 
-        # Tile edge_index N times and offset each copy by i * num_nodes.
-        base_ei = self.edge_index  # (2, E)
-        E = base_ei.size(1)
-        flat_ei = base_ei.repeat(1, N)  # (2, N*E)
-        offsets = torch.arange(N, device=x.device).repeat_interleave(E) * num_nodes
-        flat_ei = flat_ei + offsets.unsqueeze(0)
-
-        # Batch assignment vector: [0,0,...,0, 1,1,...,1, ..., N-1,...,N-1].
-        batch_idx = torch.arange(N, device=x.device).repeat_interleave(num_nodes)
-
-        # Build a minimal namespace that GNNEncoder.forward() can consume
-        # as if it were a PyG Batch.
-        class _VectorizedBatch:
-            pass
-
-        batch = _VectorizedBatch()
-        batch.x = flat_x
-        batch.edge_index = flat_ei
-        batch.batch = batch_idx
-        batch.num_graphs = N
-
+        batch = _pyg_like_batch(flat_x, flat_ei, batch_idx, N, is_real)
         return self._encoder(batch)
 
 
@@ -192,9 +209,8 @@ class PerTokenAggregator(nn.Module):
 
     - output_mode="sequence":
         Forward: (batch, seq_len, num_layers, hidden_in) -> (batch, out_dim)
-        After GNN message passing, global pool across ALL nodes (tokens × layers).
-        Use for sequence-level classification (e.g., text classification with
-        multi-token Cayley graphs, as in Pythia-14m experiments).
+        After GNN message passing, global pool across ALL real nodes
+        (tokens x layers). Use for sequence-level classification.
 
     Graph construction:
         For a sample with T tokens and L layers, the graph has T*L nodes
@@ -203,13 +219,17 @@ class PerTokenAggregator(nn.Module):
 
     This mode is Cayley-only. Supports conv_type="gin", "gcn", "gat".
 
+    Cost warning:
+        The graph has T*L nodes, and the smallest Cayley graph is sized to fit
+        that (|SL(2, Z_n)| ~ n^3). Long sequences produce very large graphs that
+        are slow to build and memory-heavy to run; graph_ops emits a warning
+        past a few thousand nodes. Keep T modest, or chunk long sequences.
+
     Notes:
-        - Different samples in a batch CAN have different seq_len (via
-          padding + a seq_lens tensor). But for simplicity, the current
-          implementation assumes all samples have the same seq_len (padded
-          to the same length). Padding tokens should be masked in the loss,
-          not in the aggregator.
-        - Cayley graph is cached for a given total_nodes count and rebuilt
+        - The current implementation assumes all samples in a batch share the
+          same seq_len (pad to the same length). Padding tokens should be masked
+          in the loss, not in the aggregator.
+        - The Cayley graph is cached for a given total_nodes count and rebuilt
           only when seq_len changes.
     """
 
@@ -230,7 +250,7 @@ class PerTokenAggregator(nn.Module):
                 (only used when output_mode="per_token"). "mean" or "sum".
             output_mode: "per_token" returns (batch, seq_len, out_dim),
                 "sequence" returns (batch, out_dim) via global pooling over
-                all nodes.
+                all real nodes.
         """
         super().__init__()
         if not isinstance(config, CayleyConfig):
@@ -248,18 +268,7 @@ class PerTokenAggregator(nn.Module):
         self.token_pooling = token_pooling
         self.output_mode = output_mode
 
-        # GNNEncoder — we use pooling="mean" for the sequence mode (global
-        # pool), and bypass it in per_token mode.
-        self._encoder = GNNEncoder(
-            in_dim=hidden_in,
-            hidden_dim=config.hidden_dim,
-            gnn_layers=config.gnn_layers,
-            gin_mlp_layers=config.gin_mlp_layers if config.conv_type == "gin" else 0,
-            conv_type=config.conv_type,
-            pooling=config.pooling,
-            dropout=config.dropout,
-            gat_heads=getattr(config, "gat_heads", 4),
-        )
+        self._encoder = build_gnn_encoder(config, hidden_in)
         self.out_dim = config.hidden_dim
 
         # Cache for Cayley graph (rebuilt when seq_len changes).
@@ -313,23 +322,23 @@ class PerTokenAggregator(nn.Module):
             x = torch.cat([x, virt], dim=1)  # (B, num_graph_nodes, D)
 
         if self.output_mode == "sequence":
-            # Global pool over ALL nodes → (B, out_dim).
-            # Use GNNEncoder's native forward with global pooling.
-            return self._forward_gnn_global_pool(x, edge_index, num_graph_nodes, B)
-        else:
-            # Per-node features → pool across layers per token → (B, T, out_dim).
-            node_features = self._forward_gnn_nodes(x, edge_index, num_graph_nodes, B)
-            # node_features: (B, num_graph_nodes, hidden_dim)
+            # Global pool over all REAL nodes -> (B, out_dim).
+            return self._forward_gnn_global_pool(
+                x, edge_index, num_graph_nodes, total_real_nodes, B
+            )
 
-            # Discard virtual padding nodes.
-            node_features = node_features[:, :total_real_nodes, :]  # (B, T*L, hidden_dim)
+        # Per-node features -> pool across layers per token -> (B, T, out_dim).
+        node_features = self._forward_gnn_nodes(x, edge_index, num_graph_nodes, B)
+        # node_features: (B, num_graph_nodes, hidden_dim)
 
-            # Reshape to (B, T, L, hidden_dim) and pool across layers per token.
-            node_features = node_features.reshape(B, T, L, -1)
-            if self.token_pooling == "mean":
-                return node_features.mean(dim=2)  # (B, T, hidden_dim)
-            else:
-                return node_features.sum(dim=2)
+        # Discard virtual padding nodes.
+        node_features = node_features[:, :total_real_nodes, :]  # (B, T*L, hidden_dim)
+
+        # Reshape to (B, T, L, hidden_dim) and pool across layers per token.
+        node_features = node_features.reshape(B, T, L, -1)
+        if self.token_pooling == "mean":
+            return node_features.mean(dim=2)  # (B, T, hidden_dim)
+        return node_features.sum(dim=2)
 
     def _forward_gnn_nodes(
         self,
@@ -353,16 +362,11 @@ class PerTokenAggregator(nn.Module):
         B = batch_size
         N_nodes = num_graph_nodes
 
-        # Flatten to (B * N_nodes, D)
         flat_x = x.reshape(B * N_nodes, -1)
+        flat_ei = _tiled_edge_index(edge_index, N_nodes, B, x.device)
 
-        # Tile edge_index for the batch.
-        E = edge_index.size(1)
-        flat_ei = edge_index.repeat(1, B)  # (2, B*E)
-        offsets = torch.arange(B, device=x.device).repeat_interleave(E) * N_nodes
-        flat_ei = flat_ei + offsets.unsqueeze(0)
-
-        # Run encoder's projection + conv layers (skip the global pooling).
+        # Run the encoder's projection + conv layers, mirroring
+        # GNNEncoder.forward but skipping global pooling (we want per-node out).
         enc = self._encoder
         h = enc.proj_in(flat_x)
         h = enc.act(h)
@@ -375,7 +379,6 @@ class PerTokenAggregator(nn.Module):
                 h = enc.act(h)
             h = enc.dropout(h)
 
-        # Reshape back to (B, N_nodes, hidden_dim)
         return h.reshape(B, N_nodes, -1)
 
     def _forward_gnn_global_pool(
@@ -383,44 +386,25 @@ class PerTokenAggregator(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         num_graph_nodes: int,
+        num_real_nodes: int,
         batch_size: int,
     ) -> torch.Tensor:
         """
-        Run GNN message passing with global pooling over all nodes per graph.
-
-        Uses GNNEncoder.forward() directly (which includes global_mean/sum/last
-        pooling), constructing the vectorized batch the same way as Aggregator.
-
-        Args:
-            x: (B, num_graph_nodes, hidden_in)
-            edge_index: (2, E) base Cayley edge_index for one graph
-            num_graph_nodes: number of nodes per graph
-            batch_size: B
+        Run GNN message passing with global pooling over all real nodes per
+        graph, using GNNEncoder.forward() and the shared vectorized batch.
 
         Returns:
-            (B, out_dim) — one vector per sample (sequence-level).
+            (B, out_dim) -- one vector per sample (sequence-level).
         """
         B = batch_size
         N_nodes = num_graph_nodes
 
         flat_x = x.reshape(B * N_nodes, -1)
+        flat_ei = _tiled_edge_index(edge_index, N_nodes, B, x.device)
+        batch_idx = _batch_assignment(N_nodes, B, x.device)
+        is_real = _real_node_mask(num_real_nodes, N_nodes, B, x.device)
 
-        E = edge_index.size(1)
-        flat_ei = edge_index.repeat(1, B)
-        offsets = torch.arange(B, device=x.device).repeat_interleave(E) * N_nodes
-        flat_ei = flat_ei + offsets.unsqueeze(0)
-
-        batch_idx = torch.arange(B, device=x.device).repeat_interleave(N_nodes)
-
-        class _VectorizedBatch:
-            pass
-
-        batch = _VectorizedBatch()
-        batch.x = flat_x
-        batch.edge_index = flat_ei
-        batch.batch = batch_idx
-        batch.num_graphs = B
-
+        batch = _pyg_like_batch(flat_x, flat_ei, batch_idx, B, is_real)
         return self._encoder(batch)
 
 
@@ -442,22 +426,22 @@ def build_aggregator(
             config (lr, weight_decay, batch_size, epochs) are ignored here --
             the caller owns the training loop.
         num_layers: Number of backbone layers to aggregate. For HuggingFace
-            transformers, this is typically `model.config.num_hidden_layers + 1`
-            (+1 for the embedding layer output).
-        hidden_in: Backbone hidden size. For HuggingFace transformers, this is
-            `model.config.hidden_size`.
+            transformers this is `model.config.num_hidden_layers + 1` (+1 for
+            the embedding-layer output). Use `ilse.num_layers_for(model)` to get
+            it without hardcoding.
+        hidden_in: Backbone hidden size (`model.config.hidden_size`, or
+            `ilse.hidden_size_for(model)`).
 
     Returns:
         Aggregator nn.Module. Forward takes (N, num_layers, hidden_in) and
         returns (N, aggregator.out_dim).
 
     Example:
-        >>> from ilse import build_aggregator, CayleyConfig
-        >>> agg = build_aggregator(CayleyConfig(), num_layers=37, hidden_in=2560)
         >>> import torch
-        >>> x = torch.randn(8, 37, 2560)
-        >>> y = agg(x)
-        >>> y.shape
+        >>> from ilse import build_aggregator, CayleyConfig
+        >>> agg = build_aggregator(CayleyConfig(), num_layers=25, hidden_in=1024)
+        >>> x = torch.randn(8, 25, 1024)
+        >>> agg(x).shape
         torch.Size([8, 256])
         >>> agg.out_dim
         256
@@ -483,33 +467,35 @@ def build_per_token_aggregator(
         token_pooling: How to pool across layers per token after GNN message
             passing. "mean" or "sum". Only used when output_mode="per_token".
         output_mode: Controls output shape:
-            - "per_token": (batch, seq_len, out_dim) — pool across layers per
-              token. Use for per-residue protein tasks.
-            - "sequence": (batch, out_dim) — global pool over all nodes. Use
-              for sequence-level classification (text classification with
-              multi-token Cayley, as in Pythia-14m experiments).
+            - "per_token": (batch, seq_len, out_dim) -- pool across layers per
+              token. Use for per-residue protein tasks with a frozen PLM.
+            - "sequence": (batch, out_dim) -- global pool over all real nodes.
+              Use for sequence-level classification.
+
+    Cost warning:
+        The graph spans seq_len*num_layers nodes; long sequences make very large
+        Cayley graphs (slow to build, memory-heavy). Keep seq_len modest.
 
     Returns:
         PerTokenAggregator nn.Module. Forward takes
         (batch, seq_len, num_layers, hidden_in).
 
     Examples:
-        Per-token output (per-residue regression):
+        Per-token output (per-residue regression on a small window):
+        >>> import torch
         >>> from ilse import build_per_token_aggregator, CayleyConfig
         >>> cfg = CayleyConfig(conv_type="gat", gat_heads=4, gnn_layers=2)
-        >>> agg = build_per_token_aggregator(cfg, num_layers=37, hidden_in=2560)
-        >>> x = torch.randn(4, 1022, 37, 2560)
-        >>> y = agg(x)
-        >>> y.shape
-        torch.Size([4, 1022, 256])
+        >>> agg = build_per_token_aggregator(cfg, num_layers=13, hidden_in=480)
+        >>> x = torch.randn(2, 16, 13, 480)
+        >>> agg(x).shape
+        torch.Size([2, 16, 256])
 
-        Sequence-level output (text classification):
-        >>> agg = build_per_token_aggregator(cfg, num_layers=25, hidden_in=1024,
+        Sequence-level output (short-text classification):
+        >>> agg = build_per_token_aggregator(cfg, num_layers=13, hidden_in=480,
         ...                                  output_mode="sequence")
-        >>> x = torch.randn(8, 128, 25, 1024)
-        >>> y = agg(x)
-        >>> y.shape
-        torch.Size([8, 256])
+        >>> x = torch.randn(4, 16, 13, 480)
+        >>> agg(x).shape
+        torch.Size([4, 256])
     """
     return PerTokenAggregator(
         config=config,
