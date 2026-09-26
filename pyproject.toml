@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ilge"
+version = "0.1.0"
+description = "ILGE: Inter-Layer Geometry Encoders — lightweight GNN/DeepSet encoders that aggregate frozen LLM layer embeddings for classification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Eyal Blyachman"},
+    {name = "Tom Ulanovski"},
+]
+keywords = [
+    "llm",
+    "graph neural network",
+    "gnn",
+    "embeddings",
+    "layer aggregation",
+    "cayley graph",
+    "representation learning",
+    "mteb",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "numpy>=1.21",
+    "scikit-learn>=1.0",
+    "tqdm",
+    "torch-geometric>=2.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/eyali123/ILGE"
+Repository = "https://github.com/eyali123/ILGE"
+Paper = "https://arxiv.org/abs/2603.22665"
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff", "build", "twine"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ilge*"]   # tests/ intentionally excluded from the built package
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "llm: requires downloading a HuggingFace model (needs network/cache)",
+]
